@@ -1,0 +1,432 @@
+# 1 — High-level overview
+
+This firmware runs on an ESP32 and implements a dual-reader access control device using two MFRC522 readers (Entry and Exit) and Firestore (via `FirebaseClient`) as the backend. Key behaviours:
+
+* Maintains an **O(1) membership set** (`g_activeSet`) of authorized card UIDs for fast lookups, plus a vector (`g_activeCards`) containing per-card metadata (start/end time).
+* Pulls `active_cards` firestore document and updates local set if `updated_at` changes.
+* Performs card authorization locally (fast) and logs events to Firestore (queued locally if offline).
+* Provides a provisioning AP + web portal for initial configuration / reconfiguration.
+* Uses SPIFFS for local persistence of config, access list, meta, caches and a log queue.
+* Supports factory reset (short/long press) and optional full wipe via a technician jumper.
+
+---
+
+# 2 — Hardware mapping & constants
+
+* **MFRC522 (Entry)**:
+
+  * SS: `MFRC522_ENTRY_SS` = **5**
+  * RST: `MFRC522_ENTRY_RST` = **21**
+* **MFRC522 (Exit)**:
+
+  * SS: `MFRC522_EXIT_SS` = **13**
+  * RST: `MFRC522_EXIT_RST` = **15**
+* **Factory reset button**: `FACTORY_RESET_PIN` = **33** (active HIGH)
+* **Technician full-wipe jumper**: `FACTORY_RESET_FULL_PIN` = **25** (active LOW when shorted to GND). Set to -1 to disable.
+* **Relay** (controls lock): `RELAY` = **32**
+
+  * `RELAY_LOCKED_STATE` = `HIGH`
+  * `RELAY_UNLOCKED_STATE` = `LOW`
+  * `DOOR_PULSE_MS` = **3000ms** (unlock pulse duration)
+
+Other important macros:
+
+* `UID_MAX_BYTES` (added): supports up to 16 bytes UIDs.
+* SPIFFS filenames (see next section).
+
+---
+
+# 3 — Files stored on SPIFFS (and formats)
+
+All files live on SPIFFS. Their paths and purposes:
+
+* `/config.json` — device provisioning config. Format (JSON keys used by `loadConfigIfPresent`):
+
+  ```json
+  {
+    "wifi_ssid":"<ssid>",
+    "wifi_password":"<password>",
+    "api_key":"<firebase_api_key>",
+    "project_id":"<firebase_project_id>",
+    "user_email":"<firebase_user_email>",
+    "user_password":"<firebase_user_password>",
+    "business_id":"<business_id>",
+    "device_name":"<human_readable_name>"
+  }
+  ```
+* `/access_list.json` — human readable active_cards snapshot (array). Each entry:
+
+  ```json
+  {"card_data":"AA11BB22","start_time":"09:00","end_time":"18:00"}
+  ```
+* `/access_meta.json` — meta file: `{"updated_at":"2025-10-14T19:19:19.733Z"}` (the code writes `updated_at` after successfully fetching active cards)
+* `/cards_cache.ndjson` — newline-delimited JSON lines used for a local card status cache (id, ok, ts). Example line:
+
+  ```json
+  {"id":"A1B2C3D4","ok":true,"ts":169XXX}
+  ```
+* `/access_logs.ndjson` — queued access log lines (compact JSON), one per line:
+
+  ```json
+  {"bid":"<businessId>","card":"<cardHex>","granted":true,"type":"entry"}
+  ```
+* `/log_counter.txt` — optional counter file used by code paths (read/write helper).
+
+Note: the code treats missing files gracefully.
+
+---
+
+# 4 — Main runtime data structures
+
+* `std::vector<ActiveCardEntry> g_activeCards`
+  Holds raw card entries (card_data string and start_time/end_time). Used for retrieving the shift times and for diagnostic prints.
+
+* `std::unordered_set<std::string> g_activeSet`
+  Contains **normalized** uppercase hex UID strings with all separators removed (O(1) membership checks). Normalization is done with `normalizeUidStr()`.
+
+* `portMUX_TYPE g_activeCardsMux` and `g_updatingActiveCards`
+  A short critical section (ESP32 portMUX) is used when the code atomically replaces `g_activeCards` and `g_activeSet` to avoid inconsistent reads during active updates.
+
+---
+
+# 5 — UID normalization and reading
+
+* `normalizeUidStr(const String &s)`:
+  Strips any non-hex characters and returns uppercase hex-only string. Example input `"AA:BB:CC"` -> `"AABBCC"`.
+
+* `readUidHexFrom(MFRC522 &r)`:
+
+  * Returns empty string if no card present.
+  * Reads `r.uid.uidByte[]` up to `UID_MAX_BYTES` and formats as uppercase hex bytes (`%02X`), then calls `normalizeUidStr()` before returning.
+  * Halts PICC after read with `PICC_HaltA()`.
+
+Normalization ensures the set lookup is stable across different reader UID representations.
+
+---
+
+# 6 — Fetching & updating `active_cards` from Firestore
+
+Function: `fetchActiveCardsFromFirebase_v2()`
+
+Flow:
+
+1. Guard: requires Wi-Fi connected, `app.ready()` and configured `g_businessId`.
+2. GET document from `businessess/<businessId>/active_cards/active_cards`.
+3. Parse `updated_at` from returned payload (robust string search via `fsGetTimestampField`). If remote `updated_at` equals local `access_meta.json` `updated_at`, skip (no change).
+4. Otherwise parse occurrences of `"card_data"` and for each extract `card_data`, `start_time`, `end_time` using `extractStringValueNear()`. Builds a `newList` of `ActiveCardEntry`.
+5. Atomically replaces `g_activeCards` and `g_activeSet` under `g_activeCardsMux`.
+6. Writes human-readable `/access_list.json` and writes `access_meta.json` using remote `updated_at` if available or current time.
+
+Important notes:
+
+* The parser is intentionally *loose/robust* (string search) to tolerate different Firestore serialization shapes.
+* After update, `g_activeSet` contains normalized UIDs for O(1) lookups.
+
+---
+
+# 7 — Card authorization logic
+
+**Entry reader (main rules)**
+
+* Read UID via `readUidHexFrom(rfidEntry)`.
+* Normalize and check membership: `g_activeSet.find(uidNorm)`.
+* If present:
+
+  * If `g_activityEnabled == false` (device held unlocked disabled?), **deny** entry (device status may block entry per policy).
+  * Else, call `findActiveCardTimes(uidNorm, nowHM, st, et)`:
+
+    * This searches `g_activeCards` for entries matching normalized UID and returns the shift that contains current time (if any).
+    * If a shift matches `currentHHMM()`, **grant**; otherwise deny.
+* If granted and device active, issue `relayGrantPulse()` (momentarily unlock).
+* Always `queueAccessLog(g_businessId, uid, grant, "entry")` for persistence.
+
+**Exit reader (main rules)**
+
+* Read UID via `readUidHexFrom(rfidExit)`.
+* Normalize and check membership: `g_activeSet.find(uid2Norm)`.
+* If present → **grant** (exit is allowed regardless of `g_activityEnabled`).
+* If granted → `relayGrantPulse()` and `queueAccessLog(...,"exit")`.
+
+Diagnostics printed for mismatches:
+
+* If in `g_activeSet` but `findActiveCardTimes` fails, code prints candidate shifts for debugging.
+* If not in set, code prints case-insensitive search result, and a short snapshot of `g_activeSet`.
+
+---
+
+# 8 — Local card status cache & remote card status fetching
+
+* `cardStatusCacheFirst(cardId, &status)`:
+
+  * Attempts to read last entry for `cardId` from `/cards_cache.ndjson`. If found and recent (`CARD_CACHE_TTL_SEC`), return cached value.
+  * If stale or not found and online and Firestore ready, calls `fsFetchCardStatus()` which fetches `businessess/<businessId>/cards/<cardId>` and returns `card_status` boolean.
+  * If fresh value obtained, appended to `/cards_cache.ndjson` with timestamp via `cacheUpsert()`.
+
+This is used when the code needs to consult per-card `card_status` in Firestore (not used in the fast path of `g_activeSet` membership, but exists for API calls).
+
+---
+
+# 9 — Access log queuing & flushing
+
+* `queueAccessLog(...)` — simply appends a compact JSON line to `/access_logs.ndjson`.
+* `flushQueueBatch(maxLines)`:
+
+  * Opens `/access_logs.ndjson`, processes up to `maxLines` entries: it attempts to create Firestore docs under `businessess/<businessId>/access_logs` with `fsCreateAccessLogAuto`.
+  * On success entries are not kept. On failure or if `businessId` missing, lines are kept for later.
+  * After processing, rewrites the queue file with kept lines.
+* `flushQueueIfNeeded()` runs periodically in `loop()` if interval passed or SPIFFS usage >= threshold.
+
+This design ensures logs are durable when offline and eventually sent.
+
+---
+
+# 10 — Provisioning portal (AP mode)
+
+* When device has no `config.json` or Wi-Fi fails for `WIFI_LOOKUP_TIMEOUT_MS` (2 min), device opens an AP: SSID `"Sentri-Setup"` with password `"12345678"` and serves a small web page on port 80.
+* Endpoints:
+
+  * `/` → provisioning page to enter Wi-Fi + Firebase credentials.
+  * `/save` → POST handler to save `config.json` atomically (tmp then rename/fallback).
+  * `/reboot` → reboot endpoint.
+  * `/status` → diagnostics JSON (added).
+* Portal can be started in forced mode (keeps open for `FIREBASE_PROVISION_WINDOW_MS` = 5 minutes).
+* The portal is registered once and served while `g_portalActive` is true (`portal.handleClient()` called in `loop()`).
+
+---
+
+# 11 — Firebase initialization and failure handling
+
+* Non-blocking init:
+
+  * `firebaseInitStart()` sets `user_auth`, calls `initializeApp(aClient, app, getAuth(user_auth), ...)` and marks `g_firebaseInitInProgress = true`.
+  * `firebaseInitPoll()` periodically calls `app.loop()` and `Docs.loop()` and times out after `FIREBASE_INIT_POLL_TIMEOUT_MS`.
+  * On success: `Docs` object obtained, `fetchActiveCardsFromFirebase_v2()` invoked, provisioning portal closed if active.
+* Failure handling:
+
+  * `asyncCB(AsyncResult &r)` analyzes events/errors. On repeated auth/400/permission failures it increments `firebaseFailCount` and employs an **exponential backoff** (computed and stored in `g_nextFirebaseInitAttempt`) before another attempt.
+  * If `firebaseFailCount >= FIREBASE_FAIL_THRESHOLD` (5), it triggers forced provisioning via `startProvisionPortal(FIREBASE_PROVISION_WINDOW_MS)` so an operator can correct credentials.
+  * Failures expire after `FIREBASE_FAIL_RESET_MS` (5 minutes).
+
+---
+
+# 12 — Device heartbeat and device registration
+
+* `heartbeat()` (called periodically, default hourly) does:
+
+  * If online + Firebase ready: upserts device docs using `fsRegisterOrUpdateDevice()` (root `devices/<mac>` and `businessess/<businessId>/business_devices/<mac>`).
+  * Calls `fsFetchActivityStatus()` to fetch device status (boolean) from `business_devices/<mac>` doc and updates `g_activityEnabled` and `/activity_state.txt`.
+  * `applyActivityRelay()` writes the relay according to `g_activityEnabled` (locked vs held unlocked).
+
+---
+
+# 13 — Reset behavior (runtime, safe handling)
+
+* `runtimeResetTick()` implements non-blocking button handling:
+
+  * Button press starts when pin sees HIGH.
+  * On release, measures hold duration:
+
+    * Held >= **1s** and < **5s** → **soft restart** (ESP.restart()).
+    * Held >= **5s** → **safe factory reset**: removes `config.json`. If `FACTORY_RESET_FULL_PIN` is shorted to GND at the time of long press, the code performs a **technician full wipe** (removes logs, caches, access_list, access_meta, etc).
+    * < 1s → ignored (debounce).
+
+Pins are configured early in `setup()` to ensure reset actions are available immediately.
+
+---
+
+# 14 — Concurrency & atomicity
+
+* Replacing `g_activeCards` and `g_activeSet` occurs in a critical section using `portENTER_CRITICAL(&g_activeCardsMux)` / `portEXIT_CRITICAL(&g_activeCardsMux)`. This keeps the readers (in `loop()`), which access `g_activeSet` and `g_activeCards`, consistent during a mid-fetch update.
+* The code keeps the critical section small — only for the actual swap.
+
+---
+
+# 15 — Important helper & parsing utilities
+
+* `fsGetStringField`, `fsGetBoolField`, `fsGetTimestampField`:
+
+  * Lightweight robust string parsers that look for fields in firestore-like JSON (works with both canonical Firestore shapes and simpler shapes). They are *not* full JSON parsers; intended for speed and to be tolerant of the SDK output.
+
+* `jsonGetStr()`:
+
+  * Simple `"key":"value"` extractor used for reading `access_meta.json` and local config.
+
+* `escapeJson()`:
+
+  * Escapes quotes/backslashes to avoid breaking saved JSON in the UI `handleSave()`.
+
+---
+
+# 16 — Diagnostic & debug outputs
+
+The firmware logs many diagnostics to `Serial`:
+
+* SPIFFS mount status and usage.
+* Loaded config summary (passwords masked by length).
+* Wi-Fi events and RSSI.
+* Firebase event/error payloads via `asyncCB`.
+* `fetchActiveCardsFromFirebase_v2()` prints a sample of up to 12 entries with raw and normalized UID and shifts.
+* On authorization, prints `ENTRY granted/denied` and `EXIT granted/denied` with timestamps and device_status.
+* Diagnostic lookup prints for mismatches, including snapshots of `g_activeSet` (first 8 entries) for debugging.
+
+You can access a short JSON diagnostics page at `http://<device_ip>/status` while provisioning portal is active.
+
+---
+
+# 17 — Key configuration & behavior settings (where to change)
+
+* Wi-Fi lookup and portal windows:
+
+  * `WIFI_LOOKUP_TIMEOUT_MS` — how long to let driver auto-retry before opening AP.
+  * `PROVISION_WINDOW_MS` — normal AP window if user opened it.
+  * `FIREBASE_PROVISION_WINDOW_MS` — forced portal window when Firebase failures accumulate.
+
+* Card cache TTL:
+
+  * `CARD_CACHE_TTL_SEC` — seconds to consider card cache fresh.
+
+* Heartbeat & flush intervals:
+
+  * `HEARTBEAT_MS` — heartbeat frequency (device upsert + status refresh).
+  * `FLUSH_INTERVAL_MS` — how often to attempt flushing logs.
+
+* SPIFFS threshold:
+
+  * `FLUSH_FS_THRESH` — fraction of SPIFFS usage that triggers an immediate flush attempt.
+
+* UID bytes:
+
+  * `UID_MAX_BYTES` — to adjust if you need to support longer UIDs (default 16).
+
+---
+
+# 18 — Failure modes & troubleshooting guide
+
+**SPIFFS mount failure**
+
+* Boot prints clear diagnostics. Check partition table and ensure a SPIFFS partition exists. If previously used LittleFS, either reformat or update code.
+
+**Wi-Fi never connects**
+
+* Check `config.json` values. If credentials wrong, provisioning portal will be forced open after retries or after Firebase failures. Use portal AP to reconfigure.
+
+**Firebase authentication or permission errors**
+
+* `asyncCB()` counts failures. If repeated (>= 5), portal is opened for operator to correct keys/credentials. Check serial logs for `Bad Request`, `permission_denied` or `400` messages.
+
+**Active cards not updating**
+
+* Confirm Firestore document `businessess/<BID>/active_cards/active_cards` exists.
+* The code checks `updated_at` to avoid full downloads; if your Firestore document lacks `updated_at`, the code still downloads and replaces the local list but will log a message.
+* Use `/status` endpoint and serial logs for `fetchActiveCardsFromFirebase_v2` diagnostic prints.
+
+**Card present in Firestore but not matched**
+
+* Check the UID normalization:
+
+  * Ensure `card_data` stored in Firestore are hex strings (colons/whitespace are tolerated but removing them in storage reduces ambiguity).
+  * Serial prints show both raw and normalized values to help match.
+* Use the printed snapshot of `g_activeSet` (first 8 entries) when debugging.
+
+**Logs not reaching Firestore**
+
+* Check `flushQueueBatch()` diagnostics: if Firestore create fails, lines remain in `/access_logs.ndjson`.
+* Confirm network and `app.ready()`.
+
+---
+
+# 19 — Useful example files
+
+**config.json**
+
+```json
+{
+  "wifi_ssid":"OfficeWiFi",
+  "wifi_password":"supersecret",
+  "api_key":"AIza...xyz",
+  "project_id":"sentri-ban2r1",
+  "user_email":"operator@example.com",
+  "user_password":"firebasepass",
+  "business_id":"myBusiness123",
+  "device_name":"Main Gate"
+}
+```
+
+**access_list.json** (example)
+
+```json
+[
+  {"card_data":"AABBCCDDEEFF","start_time":"07:00","end_time":"19:00"},
+  {"card_data":"112233445566","start_time":"00:00","end_time":"23:59"}
+]
+```
+
+**/access_logs.ndjson** (one-line example)
+
+```json
+{"bid":"myBusiness123","card":"AABBCCDDEEFF","granted":true,"type":"entry"}
+```
+
+**/cards_cache.ndjson** (one-line example)
+
+```json
+{"id":"AABBCCDDEEFF","ok":true,"ts":169XXX}
+```
+
+---
+
+# 20 — Recommended improvements & extensibility ideas
+
+* **Strict JSON parsing**: replace string-based field searches with a JSON parser (if memory permits) for more robust field extraction.
+* **Atomic update file naming**: already uses tmp+rename for config; could apply similar technique to other persisted files during updates to avoid partial writes.
+* **Delta updates**: instead of replacing entire `g_activeCards`, support incremental adds/removes if Firestore provides change sets (faster for large lists).
+* **Local TTL-based set purge**: If active_cards is very large, consider a bloom filter or fixed-size LRU cache.
+* **Rate-limited logs**: Add rate-limiting to prevent log floods (e.g., repeated denied attempts).
+* **HTTPS verification**: currently `ssl_client.setInsecure()` is used (dev). For production, implement proper root CA validation.
+* **OTA**: Add a secure OTA mechanism for in-field updates.
+* **Config UI: test button**: add a test unlock button in portal to exercise the relay without scanning a card.
+
+---
+
+# 21 — Quick mapping: important functions & where to look
+
+* Initialization & main loop:
+
+  * `setup()` — boot sequence, SPIFFS mount, RFID init, config decisions.
+  * `loop()` — handles reset, Firebase init, portal servicing, heartbeats, RFID scans.
+
+* Firebase & data sync:
+
+  * `firebaseInitStart()`, `firebaseInitPoll()`
+  * `fetchActiveCardsFromFirebase_v2()` — fetch & parse active_cards
+  * `fsCreateAccessLogAuto()` — create access log doc
+  * `fsRegisterOrUpdateDevice()` — upsert device documents
+
+* RFID & authorization:
+
+  * `readUidHexFrom(MFRC522&)`
+  * `findActiveCardTimes(...)`
+  * `relayGrantPulse()`
+
+* Persistence and parsing:
+
+  * `loadConfigIfPresent()`, `handleSave()` (portal POST handler)
+  * `loadAccessListFromFile()`, `writeAccessMeta()`
+
+* Utilities:
+
+  * `normalizeUidStr()`, `timeSync()`, `escapeJson()`, `currentHHMM()`.
+
+---
+
+# 22 — Final notes
+
+* The code focuses on **local, fast authorizations** using an in-memory set and keeps the heavier Firestore operations asynchronous and tolerant to offline conditions.
+* Serial logging is verbose by design to help debugging in the field; you can reduce printing for production to save I/O and CPU cycles.
+* The code intentionally uses "robust string parsing" for Firestore responses to tolerate various SDK shapes, but switching to a JSON parser will make it more robust long-term.
+
+If you want, I can:
+
+* generate a **compact README** for distribution to technicians,
+* produce a **sequence diagram** showing the flow of a single card tap (authorization → log queue → flush),
+* or prepare a **test checklist** for field validation steps (e.g., provisioning, simulating Firebase failures, verifying reset behavior). Which would you like next?
