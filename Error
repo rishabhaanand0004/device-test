@@ -1,0 +1,27 @@
+D:\Downloads\final\final.ino: In function 'void checkHeapHealth()':
+D:\Downloads\final\final.ino:259:5: error: 'flushQueueBatch' was not declared in this scope
+  259 |     flushQueueBatch(200); // flush more aggressively
+      |     ^~~~~~~~~~~~~~~
+D:\Downloads\final\final.ino: In function 'String escapeJson(const String&)':
+D:\Downloads\final\final.ino:426:5: error: 'else' without a previous 'if'
+  426 |     else if (c == '\\') { out += "\\"; out += '\\'; }
+      |     ^~~~
+D:\Downloads\final\final.ino: In function 'void setup()':
+D:\Downloads\final\final.ino:63:32: error: invalid conversion from 'int' to 'const esp_task_wdt_config_t*' [-fpermissive]
+   63 | #define WATCHDOG_TIMEOUT_SEC   30       // watchdog timer timeout in seconds
+      |                                ^~
+      |                                |
+      |                                int
+D:\Downloads\final\final.ino:2242:21: note: in expansion of macro 'WATCHDOG_TIMEOUT_SEC'
+ 2242 |   esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true); // enable panic on timeout
+      |                     ^~~~~~~~~~~~~~~~~~~~
+D:\Downloads\final\final.ino:2242:20: error: too many arguments to function 'esp_err_t esp_task_wdt_init(const esp_task_wdt_config_t*)'
+ 2242 |   esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true); // enable panic on timeout
+      |   ~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from D:\Downloads\final\final.ino:250:
+C:\Users\risha\AppData\Local\Arduino15\packages\esp32\tools\esp32-arduino-libs\idf-release_v5.5-b66b5448-v1\esp32/include/esp_system/include/esp_task_wdt.h:47:11: note: declared here
+   47 | esp_err_t esp_task_wdt_init(const esp_task_wdt_config_t *config);
+      |           ^~~~~~~~~~~~~~~~~
+exit status 1
+
+Compilation error: 'flushQueueBatch' was not declared in this scope
